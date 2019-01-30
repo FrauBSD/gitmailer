@@ -1,0 +1,430 @@
+#!/bin/sh
+############################################################ IDENT(1)
+#
+# $Title: Script to send mail when a commit touches particular files in git $
+# $Copyright: 2017-2019 Devin Teske. All rights reserved. $
+# $FrauBSD: gitmailer/gitmailer 2019-01-29 16:07:28 -0800 freebsdfrau $
+#
+############################################################ CONFIGURATION
+
+#
+# Mail recipient(s)
+# NB: Comments allowed (including inline comments appearing after addresses)
+#
+RECIPIENTS="
+	# Put some recipients here
+" # END-QUOTE
+
+#
+# Mail subject
+#
+SUBJECT="Change control notification for %s"
+
+#
+# Mail sender
+#
+: ${HOSTNAME:=$( hostname )}
+: ${USER:=$( id -nu )}
+FROM="Git Mailer <$USER@$HOSTNAME>"
+REPLYTO="Person A <person-a@blah>"
+REPLYTO="$REPLYTO, Person B <person-b@blah>"
+
+#
+# Repository directory
+#
+REPODIR=/var/db/gitmailer
+
+#
+# Repositories to watch
+# NB: Comments allowed (including inline comments appearing after names)
+# NB: Clone your repos into the above directory (REPODIR)
+#
+REPOS="
+	repo1
+	repo2
+	repo3
+" # END-QUOTE
+
+#
+# Branches to watch
+# NB: Comments allowed (including inline comments appearing after names)
+#
+BRANCHES="
+	master
+	release
+" # END-QUOTE
+
+#
+# Files to alert on
+# NB: Entries are awk(1) regular expressions separated by whitespace
+# NB: Comments are allowed but not on the same line as a pattern
+#
+DESC="files I care about" # High-level desc of below patterns
+FILES='
+	# Match file.c in any directory
+	^(.*/)?file\.c$
+
+	# Match file.h in any directory
+	^(.*/)?file\.h$
+' # END-QUOTE
+
+#
+# Show diff for each commit?
+# NB: Set to NULL (empty string) to disable
+#
+VERBOSE=1
+
+#
+# GitWeb URLs
+#
+GITWEB_SERVER=git.somewhere.blah
+COMMIT_URL="http://$GITWEB_SERVER/git/?p=%s;a=commit;h=%s"
+#
+# For GitLab, uncomment below and change "somedir" to proper value
+#
+#COMMIT_URL="https://$GITWEB_SERVER/somedir/%s/commit/%s"
+
+############################################################ GLOBALS
+
+pgm="${0##*/}" # Program basename
+
+#
+# Global exit status
+#
+SUCCESS=0
+FAILURE=1
+
+#
+# Strings
+#
+NL="
+" # END-QUOTE
+
+#
+# Directory holding our meta data
+#
+RUNDIR=/var/run/gitmailer
+
+#
+# Miscellaneous
+#
+AUTHOR_NAMES=
+AUTHOR_EMAILS=
+BRANCH=
+MAILBUF=
+MATCHING=
+REPOS_NAMES=
+SENDMAIL="/usr/sbin/sendmail -t"
+
+############################################################ FUNCTIONS
+
+usage()
+{
+	local optfmt="\t%-4s %s\n"
+	exec >&2
+	printf "Usage: %s [-h] [-n | recipient ...]\n" "$pgm"
+	printf "OPTIONS:\n"
+	printf "$optfmt" "-h" "Print short usage statement and exit."
+	printf "$optfmt" "-n" "Don't send mail."
+	exit $FAILURE
+}
+
+#
+# Command to generate log entries, optionally starting from some point
+#
+git_log()
+{
+	git log --pretty=format:%H --raw --encoding=UTF-8 --no-renames \
+		${1:+$1..}HEAD
+}
+
+#
+# Command to generate log entry for one commit
+#
+git_log_commit()
+{
+	if [ ! "$VERBOSE" ]; then
+		git log -1 "$1"
+		return
+	fi
+
+	#
+	# Include diffs of files matching find pattern
+	#
+	git show "$1" | awk -v find="$FILES" '
+		BEGIN { npatterns = split(find, patterns, /[[:space:]]+/) }
+		(line = $0) &&
+			sub("^diff --git a/", "", line) &&
+			sub("[[:space:]]+b/.*", "", line) \
+		{
+			diff = 1
+			check = $0
+			path = ""
+		}
+		!diff { print; next }
+		check {
+			for (n = 1; n <= npatterns; n++) {
+				if (check !~ patterns[n]) continue
+				path = check
+				break
+			}
+		}
+		path
+	' # END-QUOTE
+}
+
+#
+# Command to list branches for a particular commit by hash
+#
+git_branches()
+{
+	git branch --contains "$1"
+}
+
+#
+# Command to strip comments and conflate whitespace, returning a word list.
+# Use `-s SEP' to set the separator used (default is a single space).
+# Use `-r' if the words are regular expressions.
+#
+get_words()
+{
+	local OPTIND=1 OPTARG flag
+	local sep=" " regex=
+
+	while getopts rs: flag; do
+		case "$flag" in
+		r) regex=1 ;;
+		s) sep="$OPTARG" ;;
+		esac
+	done
+	shift $(( $OPTIND - 1 ))
+
+	awk -v regex=$regex -v sep="$sep" '
+		!/^[[:space:]]*(#|$)/ {
+			if (regex) gsub(/\\/, "&&"); else gsub(/#.*/, "")
+			nwords = split($0, words, /[[:space:]]+/)
+			for (n = 1; n <= nwords; n++)
+				if (word = words[n]) list = list sep word
+		}
+		END { print substr(list, length(sep) + 1) }
+	' # END-QUOTE
+}
+
+############################################################ MAIN
+
+#
+# Process command-line options
+#
+while getopts hn flag; do
+	case "$flag" in
+	n) SENDMAIL=cat ;;
+	*) usage # NOTREACHED
+	esac
+done
+shift $(( $OPTIND - 1 ))
+
+#
+# Check for duplicate instances
+#
+pids=
+for pid in $( pgrep "$pgm" 2> /dev/null ); do
+	case "$pid" in $$|$PPID) continue; esac
+	ps -p $pid > /dev/null 2>&1 || continue
+	pids="$pids $pid"
+done
+if [ "$pids" ]; then
+	echo "Already running:" $pids
+	exit $FAILURE
+fi
+
+#
+# Process command-line arguments
+#
+[ $# -gt 0 ] && RECIPIENTS="$*"
+
+#
+# Make directories
+#
+[ -e "$RUNDIR" ] || mkdir "$RUNDIR" || exit
+[ -e "$REPODIR" ] || mkdir "$REPODIR" || exit
+
+#
+# Make temporary files and register cleanup operation
+#
+tmpfile=$( mktemp -t $pgm.XXXXXXX ) || exit
+trap 'rm -f "$tmpfile" > /dev/null 2>&1' EXIT
+
+#
+# Strip comments and conflate whitespace
+#
+BRANCHES=$( echo "$BRANCHES" | get_words )
+FILES=$( echo "$FILES" | get_words -r )
+RECIPIENTS=$( echo "$RECIPIENTS" | get_words -s ", " )
+REPOS=$( echo "$REPOS" | get_words )
+
+#
+# Dump the logs for each repository and compile a list of matching commits
+#
+for repo in $REPOS; do
+	cd "$REPODIR/$repo" || continue
+
+	#
+	# If we're not in a bare repo, update first
+	#
+	if [ -d .git ]; then
+		git pull > /dev/null 2>&1 || continue
+	fi
+
+	#
+	# Get the last commit hash
+	#
+	last_commit_file="$RUNDIR/last_commit.$repo"
+	last_commit=$( cat "$last_commit_file" 2> /dev/null )
+
+	#
+	# Check for commits on certain files
+	#
+	git_log $last_commit > "$tmpfile"
+
+	#
+	# Update last commit file
+	#
+	last_commit=$( awk '/^[[:xdigit:]]+$/ { print; exit }' "$tmpfile" )
+	[ "$last_commit" ] && echo "$last_commit" > "$last_commit_file"
+
+	#
+	# Find matching commits
+	#
+	for hash in $( awk -v find="$FILES" '
+		BEGIN { npatterns = split(find, patterns, /[[:space:]]+/) }
+		/^[[:xdigit:]]+$/ { commit = $0; next }
+		/^$/ { commit = ""; next }
+		commit && sub(/^:[^\t]+\t/, "") {
+			for (n = 1; n <= npatterns; n++) {
+				if ($0 !~ patterns[n]) continue
+				matching[commit] = 1
+				print commit
+				commit = ""
+				break
+			}
+		}
+	' "$tmpfile" ); do
+		#
+		# Determine if commit is on one of the watched branches
+		#
+		BRANCH=$( git_branches $hash | awk -v find="$BRANCHES" '
+			BEGIN { nb = split(find, branches, /[[:space:]]+/) }
+			{
+				sub(/^\*?[[:space:]]*/, "")
+				for (n = 1; n <= nb; n++)
+					if ($0 == branches[n]) {
+						print
+						exit found++
+					}
+			}
+			END { exit !found }
+		' ) || continue
+		case "$REPOS_NAMES" in
+		"$repo"|"$repo, "*|*", $repo, "*|*", $repo") : skip ;;
+		*) REPOS_NAMES="$REPOS_NAMES${REPOS_NAMES:+, }$repo"
+		esac
+		MAILBUF="$MAILBUF$( git_log_commit $hash | awk \
+			-v repo="$repo" \
+			-v commit_url="$COMMIT_URL" \
+			-v verbose="$VERBOSE" '
+			gsub(/</, "\\&lt;") { }
+			gsub(/>/, "\\&gt;") { }
+			NF == 2 && $1 == "commit" && $2 ~ /^[[:xdigit:]]+$/ {
+				print "<hr />"
+				$2 = sprintf("<a href=\""commit_url"\">%s</a>",
+					repo, $2, $2)
+			}
+			1
+		' )$NL$NL"
+	done
+done
+
+#
+# Build a list of unique author names and e-mails
+#
+eval "$( echo "$MAILBUF" | awk '
+	function setvar(name, value) {
+		gsub(/'\''/, "&\\\\&&", value)
+		printf "%s='\''%s'\''\n", name, value
+	}
+	sub(/^Author: /, "") {
+		gsub(/&[Ll][Tt];/, "<")
+		gsub(/&[Gg][Tt];/, ">")
+		name = email = $0
+		sub(/[[:space:]]*<[^>]*>[[:space:]]*$/, "", name)
+		sub(/^.*</, "", email)
+		sub(/>.*$/, "", email)
+		if (!_n[name]++) names = names ", " name
+		if (!_e[email]++) emails = emails ", " email
+	}
+	END {
+		sub(/^, /, "", names)
+		sub(/^, /, "", emails)
+		setvar("AUTHOR_NAMES", names)
+		setvar("AUTHOR_EMAILS", emails)
+	}
+' )"
+
+#
+# Update subject and recipients
+#
+SUBJECT=$( printf "$SUBJECT" "$REPOS_NAMES" )
+RECIPIENTS="$RECIPIENTS${RECIPIENTS:+, }$AUTHOR_EMAILS"
+
+#
+# Remove duplicates from list of recipients
+#
+RECIPIENTS=$( echo "$RECIPIENTS" | awk '
+	{
+		gsub(/^[[:space:],]*|[[:space:],]*$/, "")
+		naddrs = split($0, addrs, /,[[:space:]]+/)
+		for (n = 1; n <= naddrs; n++)
+			if ((addr = addrs[n]) && ! _[addr]++)
+				emails = emails ", " addrs[n]
+	}
+	END {
+		sub(/^, /, "", emails)
+		print emails
+	}
+' )
+
+#
+# Send mail
+#
+[ "$MAILBUF" ] || exit $SUCCESS
+$SENDMAIL <<EOF
+From: $FROM
+Reply-to: $REPLYTO
+To: $RECIPIENTS
+Content-Type: text/html
+MIME-Version: 1.0
+Subject: $SUBJECT
+
+<p>
+This is an automatic notification that $AUTHOR_NAMES changed $DESC${BRANCH:+ on $BRANCH}.
+</p>
+
+<p>
+If this change was already approved, no further work is required. If not,
+please roll back the change and follow the Change Control process.
+</p>
+
+<p>
+Here is a summary of the changes:
+</p>
+
+<pre>
+$MAILBUF
+</pre>
+EOF
+
+exit $SUCCESS
+
+################################################################################
+# END
+################################################################################
